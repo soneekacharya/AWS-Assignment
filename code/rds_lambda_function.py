@@ -1,87 +1,78 @@
 import json
 import pandas as pd
-import urllib3
-import boto3
 import os
+import boto3
+import logging
+import urllib3
+import io
 import psycopg2
 
-s3 = boto3.client('s3')
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-url = "https://dummyjson.com/quotes"
+s3 = boto3.client("s3")
+
+url = "https://jsonplaceholder.typicode.com/comments"
 http = urllib3.PoolManager()
 
 def lambda_handler(event, context):
-    response = http.request('GET', url)
-    data = response.data.decode('utf-8')
-    json_data = json.loads(data)
-    df = pd.DataFrame(json_data['quotes'])
-    back_to_json = df.to_json(orient='records', indent=2)
-    # Adding raw json data to first S3 bucket (Extract)
-    s3.put_object(
-        Bucket='apprentice-training-ml-dev-bisheshwor-raw-data',
-        Key='etl-raw-data/uncleaned_quotes.json',
-        Body=back_to_json.encode('utf-8')
-    )
+    source_bucket = os.environ['SOURCE_BUCKET_NAME']
+    destination_bucket = os.environ['DESTINATION_BUCKET_NAME']
     
+    logger.info(msg="*****Lambda initialized****")
+    response = http.request('GET',url)
     
-    # Data transformation (Transform)
-    data = response.data.decode('utf-8')
-    json_data = json.loads(data)
-    df_cleaned = pd.DataFrame(json_data['quotes'])
-    df_cleaned.drop(['id', 'author'],axis=1, inplace=True)
-
-    # Adding cleaned data to second S3 bucket after converting back to json (Load)
-    back_to_json = df_cleaned.to_json(orient='records', indent=2)
-
-    s3.put_object(
-        Bucket='apprentice-training-ml-dev-bisheshwor-cleaned-data',
-        Key='etl-clean-data/cleaned_quotes.json',
-        Body=back_to_json.encode('utf-8')
-    )
-    
-    # Connection parameters
-    host = 'apprentice-training-2023-rds.cth7tqaptja4.us-west-1.rds.amazonaws.com'
-    port = 5432
-    dbname = 'postgres'
-    user = 'postgres'
-    password = 'hello123'
-    
-    # Establish the connection
-    try:
-        connection = psycopg2.connect(
-            host=host,
-            port=port,
-            dbname=dbname,
-            user=user,
-            password=password
-        )
-        cursor = connection.cursor()
-    
-        # SQL query to create a new table
-        for index, row in df.iterrows():
-            create_table_query = """
-            INSERT INTO bisheshwor (
-                id,
-                quote,
-                author)
-                VALUES
-                (%s, %s, %s);
-            """
+    data = json.loads(response.data.decode('utf-8'))
         
-            # Execute the query to create the table
-            cursor.execute(create_table_query, (
-                row['id'],
-                row['quote'],
-                row['author']))
+    # Store the JSON data in an S3 bucket    
+    s3.put_object(Body=response.data, Bucket = source_bucket, Key='etl-raw-data/comments-raw.json')
+    
+    logger.info(msg="Dumped into source bucket successfully")
+        
+    df = pd.DataFrame(data)
+    df['email'] = df['email'].str.lower()
+    transformed_df = df[['postId', 'name', 'email']].rename(columns={'postId': 'Post ID', 'name': 'Name', 'email': 'Email'})
+    
+    csv_buffer = io.StringIO()
+    transformed_df.to_csv(csv_buffer, index=False)
+    csv_data = csv_buffer.getvalue()
+
+    s3.put_object(Body=csv_data.encode('utf-8'), Bucket = destination_bucket, Key='etl-cleaned-data/comments-cleaned.csv')
+    
+    logger.info(msg="Dumped into destination bucket successfully")
+
+
+    # Retrieve environment variables
+    dbname = os.environ['DB_NAME']
+    user = os.environ['DB_USER']
+    password = os.environ['DB_PASSWORD']
+    host = os.environ['DB_HOST']
+    
+    # Establish a connection
+    connection = psycopg2.connect(dbname=dbname, user=user, password=password, host=host)
+    
+    try:
+        # Create a cursor
+        cursor = connection.cursor()
+        
+        # Insert each row into the table
+        insert_query = "INSERT INTO etl_training_sonika_comments (PostID, Name, Email) VALUES (%s, %s, %s)"
+        
+        for index, row in transformed_df.iterrows():
+            cursor.execute(insert_query, (row['Post ID'], row['Name'], row['Email']))
+        
+        # Commit the transaction
         connection.commit()
-        print("Data Inserted Successfully")
-    
-    except psycopg2.Error as e:
-        print("Error while connecting to or working with the database:", e)
-    
+        return "Data inserted successfully"
+        
+    except (Exception, psycopg2.Error) as error:
+        return f"Error: {error}"
+        
     finally:
-        if connection:
+        # Close the cursor and connection
+        if cursor:
             cursor.close()
+        if connection:
             connection.close()
 
     return {
